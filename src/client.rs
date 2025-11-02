@@ -46,10 +46,12 @@ pub async fn client_task(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("👤 Client {} lagged behind by {} messages", client_id, n);
+                        warn!("⚠️ CLIENT LAG - Client {} fell behind by {} messages (buffer size: {})", 
+                              client_id, n, BROADCAST_CHANNEL_CAPACITY);
+                        warn!("🔄 Client {} missed updates due to slow processing - using watch channel to resync", client_id);
                         // Get current state from watch channel to catch up
                         let current = snapshot_rx.borrow().clone();
-                        info!("👤 Client {} catching up: {} total messages now", 
+                        info!("✅ Client {} resynced: {} total messages now", 
                               client_id, current.total_messages);
                     }
                     Err(broadcast::error::RecvError::Closed) => {

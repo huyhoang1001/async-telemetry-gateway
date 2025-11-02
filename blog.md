@@ -1,12 +1,14 @@
-# From `mpsc` to `Notify`: Designing a Robust Async Pipeline in Rust
+# Understanding Async Primitives Through Real-World Patterns
 
-Most async Rust tutorials show you isolated examples: "Here's how `mpsc` works," or "This is what `broadcast` does." But in production systems, these primitives don't work in isolation—they form an interconnected web of communication patterns that must handle backpressure, coordinate shutdown, and maintain consistency under load.
+Most async Rust tutorials show you isolated examples: "Here's how `mpsc` works," or "This is what `broadcast` does." But understanding when and why to choose each primitive is much harder when you only see them in isolation.
 
-Through studying production async systems and their failure modes, I've learned that understanding async primitives in context is far more valuable than memorizing their individual APIs. Today, I'll walk you through a realistic "Telemetry Gateway" that demonstrates how seven different async primitives work together to create a robust, production-ready system.
+The real insight comes from seeing how these primitives behave under different conditions—what happens when channels fill up? How do you coordinate shutdown across multiple tasks? When should you use `broadcast` vs `watch` vs `mpsc`?
 
-## System Overview
+To explore these questions, I've built a "Telemetry Gateway" that demonstrates eight different async primitives working together. This isn't a production system you should copy—it's a learning tool designed to show you the behavioral differences between primitives in realistic scenarios.
 
-Our telemetry gateway simulates a real-world data ingestion pipeline:
+## Learning Through a Telemetry Gateway
+
+To understand how async primitives behave in realistic scenarios, I've created a telemetry gateway that processes sensor data:
 
 ```
 [Devices] --mpsc--> [Aggregator] --broadcast--> [Clients]
@@ -14,15 +16,18 @@ Our telemetry gateway simulates a real-world data ingestion pipeline:
     |                    +--mpsc--> [Storage]
     |
     +--Semaphore (bandwidth limits)
+    |
+    +--oneshot--> [Health Checker] (request-response)
 ```
 
-The system consists of:
-- **7 devices** generating telemetry data (temperature, humidity, battery)
-- **1 aggregator** processing all incoming data and maintaining metrics
-- **1 storage writer** batching data to a simulated database
-- **4 clients** receiving real-time updates
+This setup lets us explore:
+- **7 devices** → How does `mpsc` handle multiple producers?
+- **1 aggregator** → What happens when the consumer can't keep up?
+- **1 storage writer** → How do bounded channels create backpressure?
+- **4 clients** → When do you need `broadcast` vs `watch`?
+- **Health checks** → How does `oneshot` handle request-response patterns?
 
-Each component runs as an independent async task, communicating through carefully chosen channel types. The beauty lies not in any single primitive, but in how they complement each other.
+Each component demonstrates different primitive behaviors under load, helping you understand not just the API, but the underlying mechanics and trade-offs.
 
 ## Async Primitives in Action
 
@@ -34,6 +39,7 @@ Each primitive in the telemetry gateway addresses specific distributed systems c
 | `mpsc` | Single producer → Single consumer | Strict FIFO | Batch storage pipeline | Controlled buffering enables efficient bulk operations |
 | `broadcast` | Single producer → Multiple consumers | All messages, FIFO | Real-time client updates | Independent consumption rates without head-of-line blocking |
 | `watch` | Shared mutable state | Latest value only | System snapshot distribution | Single-value semantics eliminate replay complexity |
+| `oneshot` | Single producer → Single consumer | Single message only | Device health checks | Request-response pattern with automatic cleanup |
 | `Semaphore` | Resource pool management | No message ordering | Concurrency limiting | Models finite external resource constraints |
 | `Notify` | Event coordination | Signal only, no data | Shutdown signaling | Lightweight broadcast notification without data payload |
 | `JoinSet` | Task lifecycle tracking | Completion order varies | Structured concurrency | Deterministic cleanup with failure isolation |
@@ -127,6 +133,73 @@ The 100-message buffer provides substantial headroom for client performance vari
 **Alternative Analysis**
 
 Compared to manual fan-out using multiple `mpsc` channels, `broadcast` eliminates the publisher-side complexity of managing dynamic subscriber sets. The shared buffer approach also reduces memory overhead compared to per-client buffering, particularly important when subscriber counts scale beyond single digits.
+
+### Request-Response with `oneshot` Channels
+
+`oneshot` channels solve the classic request-response problem in async systems. Unlike `mpsc` channels that can send many messages, `oneshot` is designed for exactly one message exchange—perfect for scenarios where you need to ask a question and get back a single answer.
+
+```rust
+// Health check: Create single-use channel for request-response
+let (response_tx, response_rx) = oneshot::channel::<DeviceStatus>();
+
+// Send the response sender to the device
+health_tx.send(response_tx).await?;
+
+// Wait for the single response
+let status = response_rx.await?;
+```
+
+**How Device Health Checks Work**
+
+Every 3 seconds, the health check service randomly selects 2-3 devices to query. For each device:
+
+1. **Create oneshot pair**: `oneshot::channel()` creates a sender/receiver pair
+2. **Send request**: The sender half goes to the device via `mpsc`
+3. **Device responds**: Device sends its status back via the `oneshot` sender
+4. **Automatic cleanup**: Both halves are consumed and dropped after one use
+
+This pattern eliminates the complexity of correlating requests with responses that you'd face with `mpsc` channels.
+
+**Timeout and Error Handling**
+
+The health check demonstrates realistic error handling patterns:
+
+```rust
+match tokio::time::timeout(Duration::from_millis(500), response_rx).await {
+    Ok(Ok(status)) => {
+        // Success: got device status within timeout
+        info!("Device {} health: uptime={}s, battery={}%", 
+              status.device_id, status.uptime_seconds, status.battery_level);
+    }
+    Ok(Err(_)) => {
+        // Device dropped the sender without responding
+        info!("Device health check failed - sender dropped");
+    }
+    Err(_) => {
+        // Timeout: device didn't respond within 500ms
+        info!("Device health check timeout");
+    }
+}
+```
+
+**Why Not Use `mpsc` for Request-Response?**
+
+You could implement request-response with `mpsc` by including a correlation ID in each message, but this creates several problems:
+
+- **Correlation complexity**: You need to match responses to requests
+- **Memory leaks**: Unmatched requests accumulate in hash maps
+- **Ordering issues**: Responses might arrive out of order
+- **Cleanup burden**: You must manually clean up expired requests
+
+`oneshot` eliminates all these issues by design—each channel pair handles exactly one exchange and automatically cleans up.
+
+**Performance Characteristics**
+
+`oneshot` channels are optimized for single-use scenarios:
+- **Zero allocation** for the common case (sender and receiver in same task)
+- **Automatic cleanup** prevents memory leaks
+- **Type safety** ensures exactly one message per channel
+- **Cancellation support** via dropping either half
 
 ### State Synchronization via `watch` Channels
 

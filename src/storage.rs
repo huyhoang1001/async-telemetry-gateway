@@ -20,10 +20,12 @@ pub async fn storage_writer_task(
                 let permit = match db_pool.try_acquire() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        warn!("💾 All DB connections busy, waiting...");
+                        warn!("⚠️ DB POOL EXHAUSTED - all {} connections busy, batch {} BLOCKED", 
+                              DB_CONNECTION_POOL_SIZE, batch.batch_id);
+                        warn!("🔄 Storage writer waiting for DB connection to become available...");
                         // Wait for a connection to become available
                         let permit = db_pool.acquire().await.unwrap();
-                        info!("💾 DB connection acquired");
+                        info!("✅ DB connection acquired after wait for batch {}", batch.batch_id);
                         permit
                     }
                 };

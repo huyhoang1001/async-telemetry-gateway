@@ -138,9 +138,17 @@ impl Aggregator {
         match self.storage_tx.try_send(batch) {
             Ok(_) => info!("📦 Batch sent to storage"),
             Err(mpsc::error::TrySendError::Full(dropped_batch)) => {
-                warn!("📦 Storage queue full - applying backpressure, dropping batch {} with {} records", 
-                      dropped_batch.batch_id, dropped_batch.data.len());
-                // In production: implement retry logic, dead letter queue, or circuit breaker
+                warn!("⚠️ STORAGE BACKPRESSURE - queue full ({} capacity), batch {} with {} records BLOCKED", 
+                      STORAGE_CHANNEL_CAPACITY, dropped_batch.batch_id, dropped_batch.data.len());
+                // Try blocking send to show the backpressure effect
+                match self.storage_tx.send(dropped_batch).await {
+                    Ok(_) => {
+                        warn!("✅ Batch finally sent to storage after backpressure wait");
+                    }
+                    Err(_) => {
+                        error!("📦 Storage channel closed during backpressure wait");
+                    }
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 error!("📦 Storage channel closed unexpectedly");

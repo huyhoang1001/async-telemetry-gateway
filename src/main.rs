@@ -9,7 +9,7 @@ mod types;
 use aggregator::Aggregator;
 use client::client_task;
 use config::*;
-use device::device_task;
+use device::{device_task, DeviceStatus};
 use metrics::SystemMetrics;
 use storage::storage_writer_task;
 use types::{SystemSnapshot, TelemetryBatch, TelemetryData};
@@ -17,10 +17,11 @@ use types::{SystemSnapshot, TelemetryBatch, TelemetryData};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, watch, Notify, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tracing::{info, error};
+use rand::random;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -82,16 +83,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     
+    // Health check channels for devices (oneshot demonstration)
+    let mut health_check_txs = Vec::new();
+    
     // Spawn device tasks
     for device_id in 1..=DEVICE_COUNT {
         let tx = telemetry_tx.clone();
+        let (health_tx, health_rx) = mpsc::channel::<oneshot::Sender<DeviceStatus>>(5);
+        health_check_txs.push(health_tx);
         let semaphore = device_semaphore.clone();
         let shutdown_clone = shutdown.clone();
         
         join_set.spawn(async move {
-            device_task(device_id, tx, semaphore, shutdown_clone).await;
+            device_task(device_id, tx, health_rx, semaphore, shutdown_clone).await;
         });
     }
+    
+    // Spawn health check task (demonstrates oneshot usage)
+    join_set.spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            health_check_task(health_check_txs, shutdown).await;
+        }
+    });
     
     // Spawn client tasks
     for client_id in 1..=CLIENT_COUNT {
@@ -115,14 +129,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Trigger shutdown for all tasks via Notify
     shutdown.notify_waiters();
     
-    // Wait for all tasks to complete using JoinSet
+    // Wait for all tasks to complete using JoinSet with timeout
     let mut completed = 0;
-    while let Some(result) = join_set.join_next().await {
-        completed += 1;
-        if let Err(e) = result {
-            error!("Task failed during shutdown: {:?}", e);
+    let shutdown_timeout = Duration::from_secs(2);
+    
+    loop {
+        match tokio::time::timeout(shutdown_timeout, join_set.join_next()).await {
+            Ok(Some(task_result)) => {
+                completed += 1;
+                if let Err(e) = task_result {
+                    error!("Task failed during shutdown: {:?}", e);
+                }
+            }
+            Ok(None) => break, // All tasks completed
+            Err(_) => {
+                error!("Shutdown timeout - forcing exit");
+                break;
+            }
         }
     }
+    
+    // Abort any remaining tasks
+    join_set.abort_all();
     
     info!("✅ All {} tasks completed gracefully", completed);
     
@@ -135,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📨 mpsc::channel     - Aggregator→Storage (batching, bounded)");
     println!("📡 broadcast::channel - Aggregator→Clients (real-time updates)");
     println!("👁️  watch::channel    - Latest system snapshot sharing");
+    println!("📞 oneshot::channel  - Device health checks (request-response)");
     println!("🚀 tokio::spawn      - Concurrent tasks for each component");
     println!("🎯 JoinSet           - Track and gracefully shutdown all tasks");
     println!("🚦 Semaphore         - Device bandwidth limits & DB connection pool");
@@ -147,4 +176,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   • Semaphores control resource contention realistically");
     
     Ok(())
+}
+
+async fn health_check_task(
+    health_check_txs: Vec<mpsc::Sender<oneshot::Sender<DeviceStatus>>>,
+    shutdown: Arc<Notify>,
+) {
+    info!("🏥 Health check service started");
+    
+    let mut interval = tokio::time::interval(Duration::from_secs(3));
+    
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                // Randomly check 2-3 devices each cycle
+                let devices_to_check = random::<usize>() % 3 + 2;
+                
+                for _ in 0..devices_to_check {
+                    let device_idx = random::<usize>() % health_check_txs.len();
+                    let health_tx = &health_check_txs[device_idx];
+                    
+                    // oneshot: Create single-use channel for request-response
+                    let (response_tx, response_rx) = oneshot::channel::<DeviceStatus>();
+                    
+                    // Send health check request
+                    if let Ok(_) = health_tx.try_send(response_tx) {
+                        // oneshot: Wait for single response with shutdown check
+                        tokio::select! {
+                            result = tokio::time::timeout(Duration::from_millis(500), response_rx) => {
+                                match result {
+                                    Ok(Ok(status)) => {
+                                        info!("🏥 Device {} health: uptime={}s, battery={}%", 
+                                              status.device_id, status.uptime_seconds, status.battery_level);
+                                    }
+                                    Ok(Err(_)) => {
+                                        info!("🏥 Device {} health check failed - sender dropped", device_idx + 1);
+                                    }
+                                    Err(_) => {
+                                        info!("🏥 Device {} health check timeout", device_idx + 1);
+                                    }
+                                }
+                            }
+                            _ = shutdown.notified() => {
+                                info!("🏥 Health check service shutting down during check");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            _ = shutdown.notified() => {
+                info!("🏥 Health check service shutting down");
+                break;
+            }
+        }
+    }
 }
