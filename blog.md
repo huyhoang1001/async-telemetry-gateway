@@ -84,6 +84,19 @@ The small buffer prevents the aggregator from building massive batches that woul
 
 `mpsc` channels provide FIFO ordering per producer. Device 1's readings always arrive in temporal sequence, but Device 1's message might arrive before or after Device 2's concurrent message. This per-producer ordering preserves individual device trends while allowing natural interleaving.
 
+**Sender and Receiver Lifecycle**
+
+`mpsc` channels have specific drop semantics that affect system behavior:
+
+- **Sender lifecycle**: Each device holds a `Sender<TelemetryData>`. When a device task completes (normal shutdown or panic), its sender is automatically dropped
+- **Multiple senders**: The aggregator's receiver stays open as long as ANY sender exists. With 7 device senders, the channel closes only when all 7 devices shut down
+- **Receiver lifecycle**: When the aggregator drops its receiver, all device `send()` operations immediately return `Err(SendError)`, causing devices to detect the closed channel and exit
+- **Graceful vs abrupt closure**: 
+  - Normal shutdown: Devices receive shutdown signal → drop senders → receiver detects closure via `recv() = None`
+  - Aggregator crash: Receiver drops → all device sends fail → devices detect failure and exit
+
+This automatic cleanup prevents zombie tasks and ensures consistent shutdown behavior regardless of failure scenarios.
+
 ### Broadcast Distribution for Client Fan-Out
 
 `broadcast` channels address the fundamental challenge of one-to-many distribution with heterogeneous consumer performance:
@@ -133,6 +146,23 @@ The 100-message buffer provides substantial headroom for client performance vari
 **Alternative Analysis**
 
 Compared to manual fan-out using multiple `mpsc` channels, `broadcast` eliminates the publisher-side complexity of managing dynamic subscriber sets. The shared buffer approach also reduces memory overhead compared to per-client buffering, particularly important when subscriber counts scale beyond single digits.
+
+**Sender and Receiver Lifecycle**
+
+`broadcast` channels have unique lifecycle semantics that enable dynamic subscription management:
+
+- **Sender lifecycle**: The aggregator holds the primary `Sender<SystemSnapshot>`. Unlike `mpsc`, the broadcast channel stays open as long as the sender exists, regardless of receiver count
+- **Receiver lifecycle**: Each client creates a receiver via `sender.subscribe()`. Receivers are independent—dropping one doesn't affect others or the sender
+- **Dynamic subscription**: 
+  - New clients can `subscribe()` at any time, even after the sender has sent thousands of messages
+  - Clients can drop their receivers without coordination—no "unsubscribe" call needed
+  - The sender doesn't track subscriber count or state
+- **Channel closure behavior**:
+  - When sender drops: All receivers immediately get `RecvError::Closed` on next `recv()`
+  - When all receivers drop: Sender continues working normally, messages are simply discarded
+  - No "last subscriber" special case—the channel remains functional until sender drops
+
+This design enables resilient pub-sub patterns where subscriber churn doesn't affect the publisher or other subscribers.
 
 ### Request-Response with `oneshot` Channels
 
@@ -201,6 +231,24 @@ You could implement request-response with `mpsc` by including a correlation ID i
 - **Type safety** ensures exactly one message per channel
 - **Cancellation support** via dropping either half
 
+**Sender and Receiver Lifecycle**
+
+`oneshot` channels have the most restrictive lifecycle of all primitives, designed for exactly one message exchange:
+
+- **Creation**: `oneshot::channel()` creates a linked sender/receiver pair
+- **Single use consumption**:
+  - `sender.send(value)` consumes the sender, making it unusable afterward
+  - `receiver.await` consumes the receiver, returning the sent value
+  - Both operations can only happen once per channel pair
+- **Cancellation semantics**:
+  - If sender drops before sending: `receiver.await` returns `Err(RecvError)`
+  - If receiver drops before receiving: `sender.send()` returns `Err(SendError(value))`
+  - Either half can detect cancellation by the other half
+- **Timeout handling**: The receiver can be wrapped in `tokio::time::timeout()` to detect unresponsive senders
+- **Memory efficiency**: After message exchange, both halves are consumed and all memory is freed automatically
+
+This lifecycle makes `oneshot` perfect for request-response patterns where you need guaranteed cleanup and cancellation detection.
+
 ### State Synchronization via `watch` Channels
 
 `watch` channels solve the "current state" distribution problem by maintaining single-value semantics with efficient multi-reader access:
@@ -262,6 +310,21 @@ This dual-channel approach optimizes for both real-time updates and state synchr
 
 For telemetry monitoring, `broadcast` ensures clients observe every system state change, while `watch` enables efficient reconnection without processing stale updates.
 
+**Sender and Receiver Lifecycle**
+
+`watch` channels have unique lifecycle semantics optimized for shared state distribution:
+
+- **Sender lifecycle**: Only one sender exists per channel. When the aggregator (sender holder) drops, the channel closes permanently
+- **Receiver lifecycle**: Multiple receivers can exist via `receiver.clone()`. Each receiver maintains independent notification state but shares the same underlying value
+- **Value persistence**: The current value persists in the channel even if all receivers are dropped. New receivers created via `sender.subscribe()` immediately see the latest value
+- **Closure behavior**:
+  - When sender drops: All receivers' `changed().await` calls return `Err(RecvError)`, and `borrow()` continues returning the last sent value
+  - When all receivers drop: Sender continues working normally, updates still replace the stored value
+  - The channel maintains the last value until the sender drops
+- **Clone semantics**: `receiver.clone()` creates independent notification tracking but shares the same value storage. Each clone can `await changed()` independently
+
+This lifecycle enables efficient state synchronization where the latest value is always available, regardless of receiver lifecycle timing.
+
 ### Resource Pool Management with `Semaphore`
 
 `Semaphore` primitives model finite resource constraints that exist in real distributed systems:
@@ -304,6 +367,19 @@ Semaphores transform resource exhaustion from crash scenarios into controlled wa
 
 This approach converts resource contention from a failure mode into a flow control mechanism.
 
+**Permit Lifecycle and Resource Management**
+
+`Semaphore` permits have automatic lifecycle management that prevents resource leaks:
+
+- **Permit acquisition**: `semaphore.acquire().await` returns a `SemaphorePermit` guard
+- **Automatic release**: When the permit guard drops (via `drop()`, scope exit, or panic), the permit is automatically returned to the semaphore
+- **RAII guarantees**: Even if a task panics while holding permits, the `Drop` implementation ensures permits are returned
+- **Permit counting**: The semaphore maintains an internal counter that decreases on acquisition and increases on release
+- **Fairness**: Waiting tasks acquire permits in FIFO order, preventing starvation
+- **Semaphore lifecycle**: The semaphore itself can be dropped, causing all waiting `acquire()` calls to return `Err(AcquireError)`
+
+This design ensures that resource limits are enforced consistently, even in the presence of task failures or early returns.
+
 ### Coordination Primitives: `Notify` and `JoinSet`
 
 **Lightweight Event Signaling with `Notify`**
@@ -329,6 +405,22 @@ The shutdown sequence demonstrates `Notify`'s broadcast behavior:
 - **Completion**: Tasks exit their main loops and return from spawned functions
 
 `Notify` provides zero-overhead signaling—no memory allocation, no message serialization, just a simple atomic flag that wakes all waiters instantly.
+
+**Notification Lifecycle and Wakeup Semantics**
+
+`Notify` has stateless lifecycle semantics optimized for coordination events:
+
+- **Persistent object**: `Notify` instances don't have senders/receivers—they're persistent coordination points
+- **Waiter registration**: `notify.notified()` returns a future that completes when signaled. Multiple tasks can wait simultaneously
+- **Signal delivery**:
+  - `notify_one()`: Wakes exactly one waiting task (FIFO order)
+  - `notify_waiters()`: Wakes ALL currently waiting tasks simultaneously
+  - Signals are not queued—if no tasks are waiting, the signal is lost
+- **No message persistence**: Unlike channels, `Notify` doesn't store signals. Tasks must be waiting before the signal is sent
+- **Reusable**: After signaling, the same `Notify` can be used for future coordination events
+- **Drop behavior**: When `Notify` drops, all waiting `notified()` futures are cancelled
+
+This design makes `Notify` perfect for one-time coordination events like shutdown, where you need to wake multiple tasks simultaneously without message overhead.
 
 **Structured Concurrency with `JoinSet`**
 
@@ -380,6 +472,20 @@ This prevents the "one task kills all" problem common in naive async systems.
 5. **Process exit**: Only after all resources are released
 
 This eliminates race conditions between task cleanup and process termination.
+
+**Task Handle Lifecycle and Completion Tracking**
+
+`JoinSet` provides structured task lifecycle management with automatic cleanup:
+
+- **Task registration**: `join_set.spawn(future)` returns `()` but internally stores a `JoinHandle<T>`
+- **Completion detection**: `join_next().await` blocks until ANY tracked task completes, returning its result
+- **Handle consumption**: Each task completion consumes its handle—completed tasks are automatically removed from tracking
+- **Failure isolation**: If a task panics, `join_next()` returns `Err(JoinError)` but doesn't affect other tasks
+- **Abort semantics**: `join_set.abort_all()` cancels all remaining tasks, causing them to return `Err(JoinError::Cancelled)`
+- **Drop behavior**: When `JoinSet` drops, all tracked tasks are automatically aborted
+- **Empty detection**: `join_next()` returns `None` when no tasks remain, indicating all work is complete
+
+This lifecycle ensures no spawned tasks are abandoned and provides deterministic completion detection for graceful shutdown sequences.
 
 ## Backpressure and Resource Modeling
 
